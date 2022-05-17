@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 	"reflect"
+	"strings"
 	"sync"
 	"time"
 
@@ -27,10 +28,13 @@ import (
 	"golang.org/x/time/rate"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/apimachinery/pkg/watch"
 	clientset "k8s.io/client-go/kubernetes"
+	listerv1 "k8s.io/client-go/listers/core/v1"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/klog/v2"
 
@@ -38,6 +42,8 @@ import (
 	"github.com/koordinator-sh/koordinator/pkg/koordlet/pleg"
 	"github.com/koordinator-sh/koordinator/pkg/util"
 )
+
+const defaultPodListerIntervalSeconds = 30
 
 type StatesInformer interface {
 	Run(stopCh <-chan struct{}) error
@@ -60,6 +66,9 @@ type statesInformer struct {
 	nodeRWMutex  sync.RWMutex
 	node         *corev1.Node
 
+	podInformer cache.SharedIndexInformer
+	podLister   listerv1.PodLister
+
 	podRWMutex     sync.RWMutex
 	podMap         map[string]*PodMeta
 	podUpdatedTime time.Time
@@ -67,6 +76,8 @@ type statesInformer struct {
 
 func NewStatesInformer(config *Config, kubeClient clientset.Interface, pleg pleg.Pleg, nodeName string) StatesInformer {
 	nodeInformer := newNodeInformer(kubeClient, nodeName)
+	podInformer := newPodsInformer(kubeClient, nodeName)
+	podLister := listerv1.NewPodLister(podInformer.GetIndexer())
 
 	m := &statesInformer{
 		config:    config,
@@ -76,6 +87,9 @@ func NewStatesInformer(config *Config, kubeClient clientset.Interface, pleg pleg
 		pleg: pleg,
 
 		nodeInformer: nodeInformer,
+
+		podInformer: podInformer,
+		podLister:   podLister,
 
 		podMap:     map[string]*PodMeta{},
 		podCreated: make(chan string, 1), // set 1 buffer
@@ -103,6 +117,33 @@ func NewStatesInformer(config *Config, kubeClient clientset.Interface, pleg pleg
 			m.syncNode(newNode)
 		},
 	})
+
+	podInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc: func(obj interface{}) {
+			pod, ok := obj.(*corev1.Pod)
+			if ok {
+				// DEBUG: print pod info
+				klog.Infof("pod %s/%s, .spec.nodeName=%s", pod.Namespace, pod.Name, pod.Spec.NodeName)
+			} else {
+				klog.Errorf("pod informer add func parse pod failed, obj %T", obj)
+			}
+		},
+		UpdateFunc: func(oldObj, newObj interface{}) {
+			oldPod, oldOK := oldObj.(*corev1.Pod)
+			newPod, newOK := newObj.(*corev1.Pod)
+			if !oldOK || !newOK {
+				klog.Errorf("unable to convert object to *corev1.Pod, old %T, new %T", oldObj, newObj)
+				return
+			}
+			if reflect.DeepEqual(oldPod, newPod) {
+				klog.V(5).Infof("find pod %s/%s has not changed", newPod.Namespace, newPod.Name)
+				return
+			}
+			// DEBUG: print pod info
+			// klog.Infof("pod %s/%s, .spec.nodeName=%s", newPod.Namespace, newPod.Name, newPod.Spec.NodeName)
+		},
+	})
+
 	return m
 }
 
@@ -114,6 +155,11 @@ func (m *statesInformer) Run(stopCh <-chan struct{}) error {
 	go m.nodeInformer.Run(stopCh)
 	if !cache.WaitForCacheSync(stopCh, m.nodeInformer.HasSynced) {
 		return fmt.Errorf("timed out waiting for node caches to sync")
+	}
+
+	go m.podInformer.Run(stopCh)
+	if !cache.WaitForCacheSync(stopCh, m.podInformer.HasSynced) {
+		return fmt.Errorf("timed out waiting for pod caches to sync")
 	}
 
 	if m.config.KubeletSyncIntervalSeconds > 0 {
@@ -131,6 +177,9 @@ func (m *statesInformer) Run(stopCh <-chan struct{}) error {
 	} else {
 		klog.Infof("KubeletSyncIntervalSeconds is %d, statesInformer sync of kubelet is disabled",
 			m.config.KubeletSyncIntervalSeconds)
+
+		// DEBUG: use the pod lister
+		go wait.Until(m.syncPodLister, time.Duration(defaultPodListerIntervalSeconds)*time.Second, stopCh)
 	}
 	klog.Infof("start meta service successfully")
 	<-stopCh
@@ -183,6 +232,28 @@ func newNodeInformer(client clientset.Interface, nodeName string) cache.SharedIn
 	)
 }
 
+func newPodsInformer(client clientset.Interface, nodeName string) cache.SharedIndexInformer {
+	tweakListOptionsFunc := func(opt *metav1.ListOptions) {
+		opt.FieldSelector = "spec.nodeName=" + nodeName
+	}
+
+	return cache.NewSharedIndexInformer(
+		&cache.ListWatch{
+			ListFunc: func(options metav1.ListOptions) (runtime.Object, error) {
+				tweakListOptionsFunc(&options)
+				return client.CoreV1().Pods("").List(context.TODO(), options)
+			},
+			WatchFunc: func(options metav1.ListOptions) (watch.Interface, error) {
+				tweakListOptionsFunc(&options)
+				return client.CoreV1().Pods("").Watch(context.TODO(), options)
+			},
+		},
+		&corev1.Pod{},
+		time.Hour*12,
+		cache.Indexers{},
+	)
+}
+
 func (m *statesInformer) syncNode(newNode *corev1.Node) {
 	klog.V(5).Infof("node update detail %v", newNode)
 	m.nodeRWMutex.Lock()
@@ -211,6 +282,19 @@ func (m *statesInformer) syncKubelet() error {
 	m.podUpdatedTime = time.Now()
 	klog.Infof("get pods from kubelet success, len %d", len(m.podMap))
 	return nil
+}
+
+func (m *statesInformer) syncPodLister() {
+	podList, err := m.podLister.List(labels.Everything())
+	if err != nil {
+		klog.Errorf("get pods from pod lister failed, err: %v", err)
+		return
+	}
+
+	// DEBUG: only print pod info, but not update the store
+	klog.Infof("get pods from pod lister success, len %d", len(podList))
+	klog.V(4).Infof("get pods [%s]", dumpPodsNamespacedNames(podList))
+	return
 }
 
 func (m *statesInformer) syncKubeletLoop(duration time.Duration, stopCh <-chan struct{}) {
@@ -244,4 +328,13 @@ func genPodCgroupParentDir(pod *corev1.Pod) string {
 	// todo use cri interface to get pod cgroup dir
 	// e.g. kubepods-burstable.slice/kubepods-burstable-pod9dba1d9e_67ba_4db6_8a73_fb3ea297c363.slice/
 	return util.GetPodKubeRelativePath(pod)
+}
+
+func dumpPodsNamespacedNames(pods []*corev1.Pod) string {
+	var b strings.Builder
+	for _, pod := range pods {
+		b.WriteString(util.GetPodKey(pod))
+		b.WriteString(", ")
+	}
+	return b.String()[:b.Len()-2]
 }
