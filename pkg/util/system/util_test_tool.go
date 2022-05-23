@@ -21,6 +21,8 @@ import (
 	"os"
 	"path"
 	"testing"
+
+	"github.com/stretchr/testify/assert"
 )
 
 type FileTestUtil struct {
@@ -30,24 +32,20 @@ type FileTestUtil struct {
 	t *testing.T
 }
 
-// Creates a new test util for the specified subsystem
+// NewFileTestUtil creates a new test util for the specified subsystem
 func NewFileTestUtil(t *testing.T) *FileTestUtil {
-	tempDir, err := ioutil.TempDir("/tmp", "koordlet_test")
+	// NOTE: When $TMPDIR is not set, `t.TempDir()` can use different base directory on Mac OS X and Linux, which may
+	// generates too long paths to test unix socket.
+	t.Setenv("TMPDIR", "/tmp")
+	tempDir := t.TempDir()
 	HostSystemInfo.IsAnolisOS = true
 
-	if err != nil {
-		t.Fatal(err)
-	}
-
 	Conf.ProcRootDir = path.Join(tempDir, "proc")
-	os.MkdirAll(Conf.ProcRootDir, 0777)
+	err := os.MkdirAll(Conf.ProcRootDir, 0777)
+	assert.NoError(t, err)
 	Conf.CgroupRootDir = tempDir
 
 	return &FileTestUtil{TempDir: tempDir, t: t}
-}
-
-func (c *FileTestUtil) Cleanup() {
-	os.RemoveAll(c.TempDir)
 }
 
 func (c *FileTestUtil) MkDirAll(dirRelativePath string) {

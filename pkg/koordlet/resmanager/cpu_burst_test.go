@@ -689,7 +689,6 @@ func TestCPUBurst_applyCPUBurst(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			testHelper := system.NewFileTestUtil(t)
-			defer testHelper.Cleanup()
 
 			b := &CPUBurst{
 				executor: NewResourceUpdateExecutor("CPUBurstTestExecutor", 60),
@@ -1187,7 +1186,6 @@ func TestCPUBurst_applyCFSQuotaBurst(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			testHelper := system.NewFileTestUtil(t)
-			defer testHelper.Cleanup()
 
 			stop := make(chan struct{})
 			defer func() { stop <- struct{}{} }()
@@ -1537,6 +1535,7 @@ func TestCPUBurst_start(t *testing.T) {
 			ctl := gomock.NewController(t)
 			mockStatesInformer := mock_statesinformer.NewMockStatesInformer(ctl)
 			mockStatesInformer.EXPECT().GetAllPods().Return(getPodMetas(tt.fields.pods)).AnyTimes()
+			mockStatesInformer.EXPECT().GetNodeSLO().Return(tt.fields.nodeSLO).AnyTimes()
 
 			mockMetricCache := mock_metriccache.NewMockMetricCache(ctl)
 			mockMetricCache.EXPECT().GetNodeResourceMetric(gomock.Any()).Return(tt.fields.nodeMetric).AnyTimes()
@@ -1562,11 +1561,9 @@ func TestCPUBurst_start(t *testing.T) {
 				metricCache:    mockMetricCache,
 				eventRecorder:  fakeRecorder,
 				kubeClient:     client,
-				nodeSLO:        tt.fields.nodeSLO,
 			}
 
 			testHelper := system.NewFileTestUtil(t)
-			defer testHelper.Cleanup()
 
 			b := NewCPUBurst(resmanager)
 			stop := make(chan struct{})
