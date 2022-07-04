@@ -38,12 +38,23 @@ const (
 	CgroupMaxValueStr string = "9223372036854775807"
 )
 
-const EmptyValueError string = "EmptyValueError"
+const (
+	EmptyValueError       string = "EmptyValueError"
+	AnolisOSRequiredError string = "need anolis kernel"
+)
 
 type CPUStatRaw struct {
 	NrPeriod             int64
 	NrThrottled          int64
 	ThrottledNanoSeconds int64
+}
+
+func IsAnolisOSRequiredError(err error) bool {
+	return strings.HasSuffix(err.Error(), AnolisOSRequiredError)
+}
+
+func WrapAnolisOSRequiredError(format string, a ...interface{}) error {
+	return fmt.Errorf(format+", %s", a, AnolisOSRequiredError)
 }
 
 func CgroupFileWriteIfDifferent(cgroupTaskDir string, file CgroupFile, value string) error {
@@ -62,7 +73,7 @@ func CgroupFileWriteIfDifferent(cgroupTaskDir string, file CgroupFile, value str
 
 func CgroupFileReadInt(cgroupTaskDir string, file CgroupFile) (*int64, error) {
 	if file.IsAnolisOS && !HostSystemInfo.IsAnolisOS {
-		return nil, fmt.Errorf("read cgroup config : %s fail, need anolis kernel", file.ResourceFileName)
+		return nil, WrapAnolisOSRequiredError("read cgroup config: %s fail", file.ResourceFileName)
 	}
 
 	dataStr, err := CgroupFileRead(cgroupTaskDir, file)
@@ -88,7 +99,7 @@ func CgroupFileReadInt(cgroupTaskDir string, file CgroupFile) (*int64, error) {
 
 func CgroupFileRead(cgroupTaskDir string, file CgroupFile) (string, error) {
 	if file.IsAnolisOS && !HostSystemInfo.IsAnolisOS {
-		return "", fmt.Errorf("read cgroup config : %s fail, need anolis kernel", file.ResourceFileName)
+		return "", WrapAnolisOSRequiredError("read cgroup config: %s fail", file.ResourceFileName)
 	}
 
 	klog.V(5).Infof("read %s,%s", cgroupTaskDir, file.ResourceFileName)
@@ -100,7 +111,7 @@ func CgroupFileRead(cgroupTaskDir string, file CgroupFile) (string, error) {
 
 func CgroupFileWrite(cgroupTaskDir string, file CgroupFile, data string) error {
 	if file.IsAnolisOS && !HostSystemInfo.IsAnolisOS {
-		return fmt.Errorf("write cgroup config : %v [%s] fail, need anolis kernel", file.ResourceFileName, data)
+		return WrapAnolisOSRequiredError("write cgroup config: %v [%s] fail", file.ResourceFileName, data)
 	}
 
 	klog.V(5).Infof("write %s,%s [%s]", cgroupTaskDir, file.ResourceFileName, data)

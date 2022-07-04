@@ -25,6 +25,7 @@ import (
 	"time"
 
 	"github.com/golang/mock/gomock"
+	"github.com/stretchr/testify/assert"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -191,18 +192,22 @@ func initContainerCFSQuota(podMeta *statesinformer.PodMeta, containersNameValue 
 	}
 }
 
-func getPodCPUBurst(podDir string, helper *system.FileTestUtil) int64 {
+func getPodCPUBurst(podDir string) (int64, error) {
 	podPath := util.GetPodCgroupDirWithKube(podDir)
-	valueStr := helper.ReadCgroupFileContents(podPath, system.CPUBurst)
-	value, _ := strconv.ParseInt(valueStr, 10, 64)
-	return value
+	valueStr, err := system.CgroupFileRead(podPath, system.CPUBurst)
+	if err != nil {
+		return 0, err
+	}
+	return strconv.ParseInt(valueStr, 10, 64)
 }
 
-func getContainerCPUBurst(podDir string, containerStat *corev1.ContainerStatus, helper *system.FileTestUtil) int64 {
+func getContainerCPUBurst(podDir string, containerStat *corev1.ContainerStatus) (int64, error) {
 	containerPath, _ := util.GetContainerCgroupPathWithKube(podDir, containerStat)
-	valueStr := helper.ReadCgroupFileContents(containerPath, system.CPUBurst)
-	value, _ := strconv.ParseInt(valueStr, 10, 64)
-	return value
+	valueStr, err := system.CgroupFileRead(containerPath, system.CPUBurst)
+	if err != nil {
+		return 0, err
+	}
+	return strconv.ParseInt(valueStr, 10, 64)
 }
 
 func getPodCFSQuota(podMeta *statesinformer.PodMeta, helper *system.FileTestUtil) int64 {
@@ -533,6 +538,8 @@ func TestCPUBurst_applyCPUBurst(t *testing.T) {
 	type fields struct {
 		podName      string
 		containerRes map[string]corev1.ResourceRequirements
+		specNotFound bool
+		notAnolisOS  bool
 	}
 	type args struct {
 		burstCfg slov1alpha1.CPUBurstConfig
@@ -685,6 +692,82 @@ func TestCPUBurst_applyCPUBurst(t *testing.T) {
 				podBurstVal: 0,
 			},
 		},
+		{
+			name: "skip-for-spec-not-found-container",
+			fields: fields{
+				podName: "test-pod-1",
+				containerRes: map[string]corev1.ResourceRequirements{
+					"test-container-1": {
+						Requests: corev1.ResourceList{
+							corev1.ResourceCPU: *resource.NewMilliQuantity(3000, resource.DecimalSI),
+						},
+						Limits: corev1.ResourceList{
+							corev1.ResourceCPU: *resource.NewMilliQuantity(5000, resource.DecimalSI),
+						},
+					},
+					"test-container-2": {
+						Requests: corev1.ResourceList{
+							corev1.ResourceCPU: *resource.NewMilliQuantity(2000, resource.DecimalSI),
+						},
+						Limits: corev1.ResourceList{
+							corev1.ResourceCPU: *resource.NewMilliQuantity(3000, resource.DecimalSI),
+						},
+					},
+				},
+				specNotFound: true,
+			},
+			args: args{
+				burstCfg: slov1alpha1.CPUBurstConfig{
+					Policy:          slov1alpha1.CFSQuotaBurstOnly,
+					CPUBurstPercent: pointer.Int64Ptr(500),
+				},
+			},
+			want: want{
+				containerBurstVal: map[string]int64{
+					"test-container-1": 0,
+					"test-container-2": 0,
+				},
+				podBurstVal: 0,
+			},
+		},
+		{
+			name: "skip-for-unsupported-os",
+			fields: fields{
+				podName: "test-pod-1",
+				containerRes: map[string]corev1.ResourceRequirements{
+					"test-container-1": {
+						Requests: corev1.ResourceList{
+							corev1.ResourceCPU: *resource.NewMilliQuantity(3000, resource.DecimalSI),
+						},
+						Limits: corev1.ResourceList{
+							corev1.ResourceCPU: *resource.NewMilliQuantity(5000, resource.DecimalSI),
+						},
+					},
+					"test-container-2": {
+						Requests: corev1.ResourceList{
+							corev1.ResourceCPU: *resource.NewMilliQuantity(2000, resource.DecimalSI),
+						},
+						Limits: corev1.ResourceList{
+							corev1.ResourceCPU: *resource.NewMilliQuantity(3000, resource.DecimalSI),
+						},
+					},
+				},
+				notAnolisOS: true,
+			},
+			args: args{
+				burstCfg: slov1alpha1.CPUBurstConfig{
+					Policy:          slov1alpha1.CFSQuotaBurstOnly,
+					CPUBurstPercent: pointer.Int64Ptr(500),
+				},
+			},
+			want: want{
+				containerBurstVal: map[string]int64{
+					"test-container-1": 0,
+					"test-container-2": 0,
+				},
+				podBurstVal: 0,
+			},
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -699,25 +782,38 @@ func TestCPUBurst_applyCPUBurst(t *testing.T) {
 			defer func() { stop <- struct{}{} }()
 
 			podMeta := createPodMetaByResource(tt.fields.podName, tt.fields.containerRes)
+			if tt.fields.specNotFound {
+				podMeta.Pod.Spec.Containers = nil
+			}
 
 			initPodCPUBurst(podMeta, 0, testHelper)
 			initContainerCPUBurst(podMeta, 0, testHelper)
+
+			if tt.fields.notAnolisOS {
+				system.HostSystemInfo.IsAnolisOS = false
+			}
 
 			b.applyCPUBurst(&tt.args.burstCfg, podMeta)
 
 			for i := range podMeta.Pod.Status.ContainerStatuses {
 				containerStat := &podMeta.Pod.Status.ContainerStatuses[i]
 				want := tt.want.containerBurstVal[containerStat.Name]
-				got := getContainerCPUBurst(podMeta.CgroupDir, containerStat, testHelper)
-				if !reflect.DeepEqual(got, want) {
-					t.Errorf("container %v applyCPUBurst() = %v, want = %v", containerStat.Name, got, want)
+				got, err := getContainerCPUBurst(podMeta.CgroupDir, containerStat)
+				if tt.fields.notAnolisOS {
+					assert.Equal(t, true, system.IsAnolisOSRequiredError(err))
+					continue
 				}
+				assert.NoError(t, err, "container "+containerStat.Name)
+				assert.Equal(t, want, got, "container "+containerStat.Name)
 			}
 
-			gotPod := getPodCPUBurst(podMeta.CgroupDir, testHelper)
-			if !reflect.DeepEqual(gotPod, tt.want.podBurstVal) {
-				t.Errorf("pod %v applyCPUBurst() = %v, want = %v", podMeta.Pod.Name, gotPod, tt.want.podBurstVal)
+			gotPod, err := getPodCPUBurst(podMeta.CgroupDir)
+			if tt.fields.notAnolisOS {
+				assert.Equal(t, true, system.IsAnolisOSRequiredError(err))
+				return
 			}
+			assert.NoError(t, err, "pod "+podMeta.Pod.Name)
+			assert.Equal(t, tt.want.podBurstVal, gotPod, "pod "+podMeta.Pod.Name)
 		})
 	}
 }
@@ -1582,11 +1678,9 @@ func TestCPUBurst_start(t *testing.T) {
 
 			for _, podMeta := range podMetas {
 				wantPodCPUBurst := tt.want.podBurstVal[podMeta.Pod.Name]
-				gotPodCPUBurst := getPodCPUBurst(podMeta.CgroupDir, testHelper)
-				if !reflect.DeepEqual(gotPodCPUBurst, wantPodCPUBurst) {
-					t.Errorf("pod %v cpu burst after start() = %v, want = %v",
-						podMeta.Pod.Name, gotPodCPUBurst, wantPodCPUBurst)
-				}
+				gotPodCPUBurst, err := getPodCPUBurst(podMeta.CgroupDir)
+				assert.NoError(t, err)
+				assert.Equal(t, wantPodCPUBurst, gotPodCPUBurst, "pod "+podMeta.Pod.Name)
 
 				wantPodCFSQuota := tt.want.podCFSQuotaVal[podMeta.Pod.Name]
 				gotPodCFSQuota := getPodCFSQuota(podMeta, testHelper)
@@ -1599,11 +1693,9 @@ func TestCPUBurst_start(t *testing.T) {
 					containerStat := &podMeta.Pod.Status.ContainerStatuses[i]
 
 					wantContainerCPUBurst := tt.want.containerBurstVal[containerStat.Name]
-					gotContainerCPUBurst := getContainerCPUBurst(podMeta.CgroupDir, containerStat, testHelper)
-					if !reflect.DeepEqual(gotContainerCPUBurst, wantContainerCPUBurst) {
-						t.Errorf("container %v cpu burst after start() = %v, wantContainerCPUBurst = %v",
-							containerStat.Name, gotContainerCPUBurst, wantContainerCPUBurst)
-					}
+					gotContainerCPUBurst, err := getContainerCPUBurst(podMeta.CgroupDir, containerStat)
+					assert.NoError(t, err)
+					assert.Equal(t, wantContainerCPUBurst, gotContainerCPUBurst, "container "+containerStat.Name)
 
 					wantContainerCFSQuota := tt.want.containerCFSQuotaVal[containerStat.Name]
 					gotContainerCFSQuota := getContainerCFSQuota(podMeta.CgroupDir, containerStat, testHelper)
