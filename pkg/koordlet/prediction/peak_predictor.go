@@ -34,7 +34,7 @@ import (
 type PredictorType int
 
 const (
-	// ProdReclaimablePredictor represents the type of a reclaimable production predictor.
+	// ProdReclaimablePredictor represents the type of reclaimable production predictor.
 	ProdReclaimablePredictor PredictorType = iota
 )
 
@@ -103,7 +103,7 @@ func (p *emptyPredictor) GetPredictorName() string {
 }
 
 // AddPod adds a pod to the predictor for resource prediction.
-func (p *emptyPredictor) AddPod(pod *v1.Pod) error {
+func (p *emptyPredictor) AddPod(_ *v1.Pod) error {
 	return nil
 }
 
@@ -119,7 +119,7 @@ func NewEmptyPredictorFactory() PredictorFactory {
 type emptyPredictorFactory struct {
 }
 
-func (f *emptyPredictorFactory) New(t PredictorType) Predictor {
+func (f *emptyPredictorFactory) New(_ PredictorType) Predictor {
 	return &emptyPredictor{}
 }
 
@@ -151,7 +151,7 @@ func (p *podReclaimablePredictor) AddPod(pod *v1.Pod) error {
 	}
 
 	if p.pods[string(pod.UID)] {
-		return fmt.Errorf("Pod %s already exist in the pod reclaimable predictor", util.GetPodKey(pod))
+		return fmt.Errorf("pod %s already exist in the pod reclaimable predictor", util.GetPodKey(pod))
 	}
 	p.pods[string(pod.UID)] = true
 
